@@ -1,0 +1,67 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build and smoke test
+        run: scripts/smoke.sh
+
+  publish:
+    needs: smoke
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      AWS_ROLE_ARN: ${{ secrets.AWS_ROLE_ARN }}
+      ECR_REPOSITORY: ${{ secrets.ECR_REPOSITORY }}
+      AWS_REGION: ${{ vars.AWS_REGION }}
+    steps:
+      - name: Check publish configuration
+        id: config
+        run: |
+          if [ -n "$AWS_ROLE_ARN" ] && [ -n "$ECR_REPOSITORY" ] && [ -n "$AWS_REGION" ]; then
+            echo "enabled=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::AWS_ROLE_ARN, ECR_REPOSITORY or AWS_REGION is not set; skipping publish"
+          fi
+
+      - uses: actions/checkout@v4
+        if: steps.config.outputs.enabled == 'true'
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        if: steps.config.outputs.enabled == 'true'
+        with:
+          role-to-assume: ${{ env.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - uses: aws-actions/amazon-ecr-login@v2
+        if: steps.config.outputs.enabled == 'true'
+
+      - uses: docker/setup-qemu-action@v3
+        if: steps.config.outputs.enabled == 'true'
+
+      - uses: docker/setup-buildx-action@v3
+        if: steps.config.outputs.enabled == 'true'
+
+      - uses: docker/build-push-action@v6
+        if: steps.config.outputs.enabled == 'true'
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: |
+            ${{ env.ECR_REPOSITORY }}:${{ github.sha }}
+            ${{ env.ECR_REPOSITORY }}:latest
