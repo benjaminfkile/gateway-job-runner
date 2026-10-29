@@ -1,9 +1,11 @@
 #!/usr/bin/env bash
 # Smoke test of the job runner image: builds it locally and proves the
-# entrypoint contract with three runs.
+# entrypoint contract with five runs.
 #   1. a two-line script (echo plus exit 3) exits 3 and its line is printed
 #   2. no script exits 64
 #   3. psql, aws and jq are present and the script exits 0
+#   4. load mode runs a 12 s k6 scenario and prints its banner and stats lines
+#   5. load mode without a scenario exits 64
 # IMAGE overrides the local tag the image is built as.
 set -euo pipefail
 
@@ -14,6 +16,11 @@ failures=0
 
 b64() {
     printf '%s' "$1" | base64 | tr -d '\n'
+}
+
+# Runs jq from the image under test, so the host needs no jq.
+image_jq() {
+    docker run --rm -i --entrypoint jq "$image" "$@"
 }
 
 check() {
@@ -68,6 +75,78 @@ code=$?
 set -e
 printf '%s\n' "$out"
 check "exit code" 0 "$code"
+
+load_env=(-e GATEWAY_LOAD_RUN_ID=1 -e GATEWAY_LOAD_SCENARIO=smoke -e GATEWAY_LOAD_INDEX=0
+    -e GATEWAY_LOAD_COUNT=1 -e GATEWAY_LOAD_VUS=1 -e GATEWAY_LOAD_STATS_URL=)
+
+echo "case 4: load mode prints stats lines"
+scenario="$(cat <<'SCENARIO'
+import { sleep } from 'k6';
+import { Counter, Trend } from 'k6/metrics';
+
+const ticks = new Counter('smoke_ticks');
+const ms = new Trend('smoke_ms');
+
+export const options = {
+    scenarios: {
+        smoke: {
+            executor: 'ramping-vus',
+            startVUs: 1,
+            stages: [{ duration: '12s', target: 1 }],
+        },
+    },
+};
+
+export default function () {
+    ticks.add(1);
+    ms.add(Math.random() * 10);
+    sleep(1);
+}
+SCENARIO
+)"
+set +e
+out="$(docker run --rm "${load_env[@]}" -e GATEWAY_LOAD_SCRIPT="$(b64 "$scenario")" "$image" 2>&1)"
+code=$?
+set -e
+printf '%s\n' "$out"
+check "exit code" 0 "$code"
+if grep -qx 'gateway-load: run_id=1 scenario=smoke index=0 count=1 vus=1' <<<"$out"; then
+    echo "ok   banner line"
+else
+    echo "FAIL banner line missing"
+    failures=$((failures + 1))
+fi
+stats="$(grep '^{"runId"' <<<"$out" || true)"
+lines="$(grep -c . <<<"$stats" || true)"
+if [ "$lines" -ge 2 ]; then
+    echo "ok   $lines stats lines"
+else
+    echo "FAIL want at least 2 stats lines, got $lines"
+    failures=$((failures + 1))
+fi
+bad=0
+while IFS= read -r line; do
+    [ -n "$line" ] || continue
+    if ! image_jq -e '.runId == 1 and .index == 0 and (.vus | type) == "number"' <<<"$line" >/dev/null 2>&1; then
+        bad=$((bad + 1))
+    fi
+done <<<"$stats"
+check "stats lines with runId 1, index 0 and numeric vus" "$lines" "$((lines - bad))"
+last="$(tail -n 1 <<<"$stats")"
+if image_jq -e '.metrics.smoke_ticks.count > 0 and .metrics.smoke_ms.type == "trend"' <<<"$last" >/dev/null 2>&1; then
+    echo "ok   last line carries smoke_ticks and smoke_ms"
+else
+    echo "FAIL last line lacks smoke_ticks.count > 0 or smoke_ms.type trend"
+    failures=$((failures + 1))
+fi
+
+echo "case 5: load mode without a scenario exits 64"
+set +e
+out="$(docker run --rm "${load_env[@]}" "$image" 2>&1)"
+code=$?
+set -e
+printf '%s\n' "$out"
+check "exit code" 64 "$code"
 
 if [ "$failures" -ne 0 ]; then
     echo "smoke: $failures check(s) failed"
